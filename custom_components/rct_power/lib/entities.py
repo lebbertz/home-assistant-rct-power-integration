@@ -136,6 +136,15 @@ inverter_sensor_entity_descriptions: list[RctPowerSensorEntityDescription] = [
         state_class=SensorStateClass.TOTAL_INCREASING,
         get_native_value=get_first_api_response_value_as_absolute_state,
     ),
+    RctPowerSensorEntityDescription(
+        get_device_info=get_inverter_device_info,
+        key="energy.e_dc_total",
+        object_names=["energy.e_dc_total[0]", "energy.e_dc_total[1]"],
+        name="All Generators Energy Production Total",
+        update_priority=EntityUpdatePriority.INFREQUENT,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        get_native_value=sum_api_response_values_as_state,
+    ),
 ]
 
 bitfield_sensor_entity_descriptions: list[RctPowerBitfieldSensorEntityDescription] = [
