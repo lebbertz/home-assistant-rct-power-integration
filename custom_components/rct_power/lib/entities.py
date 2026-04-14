@@ -126,6 +126,16 @@ inverter_sensor_entity_descriptions: list[RctPowerSensorEntityDescription] = [
         update_priority=EntityUpdatePriority.INFREQUENT,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
+    RctPowerSensorEntityDescription(
+        get_device_info=get_inverter_device_info,
+        key="energy.e_grid_feed_absolute_total",
+        unique_id="energy.e_grid_feed_absolute_total",
+        object_names=["energy.e_grid_feed_total"],
+        name="Grid Energy Production Absolute Total",
+        update_priority=EntityUpdatePriority.INFREQUENT,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        get_native_value=get_first_api_response_value_as_absolute_state,
+    ),
 ]
 
 bitfield_sensor_entity_descriptions: list[RctPowerBitfieldSensorEntityDescription] = [
