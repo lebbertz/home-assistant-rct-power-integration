@@ -1,4 +1,4 @@
-"""Continuous central reader for RCT Power with its own request cycles."""
+"""Continuous central reader for RCT Power with adaptive request suppression."""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from rctclient.exceptions import (
+    FrameCRCMismatch,
+    FrameLengthExceeded,
+    InvalidCommand,
+)
 from rctclient.frame import ReceiveFrame, SendFrame
 from rctclient.registry import REGISTRY
 from rctclient.types import Command, EventEntry
@@ -15,14 +20,23 @@ from rctclient.utils import decode_value
 from ..const import LOGGER
 
 CONNECTION_TIMEOUT = 20
-CACHE_MAX_AGE_SECONDS = 10
-RECONNECT_DELAY = 3
+CACHE_MAX_AGE_SECONDS = 20
+RECONNECT_DELAY = 5
 
 # Request pacing
 FREQUENT_INTERVAL_SECONDS = 15
 INFREQUENT_INTERVAL_SECONDS = 120
-INTER_REQUEST_DELAY_SECONDS = 0.15
-IDLE_SLEEP_SECONDS = 0.05
+
+# Important: much gentler pacing than before
+INTER_REQUEST_DELAY_SECONDS = 0.35
+IDLE_SLEEP_SECONDS = 0.10
+
+# Do not start infrequent immediately after connect
+INITIAL_INFREQUENT_DELAY_SECONDS = 45
+
+# Only request an object if the cached value is older than these thresholds
+FREQUENT_REQUEST_IF_OLDER_THAN_SECONDS =1
+INFREQUENT_REQUEST_IF_OLDER_THAN_SECONDS = 90
 
 type ReaderValue = (
     bool
@@ -48,6 +62,7 @@ class RctReader:
     - keeps one TCP connection open
     - continuously reads everything that comes in
     - actively sends requests in its own cycles
+    - suppresses requests when fresh cache data already exists
     - stores all decoded values in a cache
     """
 
@@ -88,6 +103,7 @@ class RctReader:
 
         self._running = False
         self._connection_lock = asyncio.Lock()
+        self._connected_at_loop_time: float = 0.0
 
     # ===============================
     # PUBLIC API
@@ -176,6 +192,7 @@ class RctReader:
             if self._reader.at_eof():
                 raise UpdateFailed("Reader stream closed immediately after connect")
 
+            self._connected_at_loop_time = asyncio.get_running_loop().time()
             LOGGER.debug("RCT reader connected")
 
     async def _close_connection(self) -> None:
@@ -198,11 +215,43 @@ class RctReader:
 
         while self._running and not self._reader.at_eof():
             frame = ReceiveFrame()
+            frame_broken = False
 
             while not frame.complete() and not self._reader.at_eof():
-                data = await self._reader.read(1)
-                if data:
+                try:
+                    data = await self._reader.read(1)
+                    if not data:
+                        await asyncio.sleep(IDLE_SLEEP_SECONDS)
+                        continue
+
                     frame.consume(data)
+
+                except InvalidCommand as exc:
+                    LOGGER.debug(
+                        "Reader dropped frame due to invalid command while syncing stream: %s",
+                        str(exc),
+                    )
+                    frame_broken = True
+                    break
+
+                except FrameCRCMismatch as exc:
+                    LOGGER.debug(
+                        "Reader dropped frame due to CRC mismatch while syncing stream: %s",
+                        str(exc),
+                    )
+                    frame_broken = True
+                    break
+
+                except FrameLengthExceeded as exc:
+                    LOGGER.debug(
+                        "Reader dropped frame due to frame length exceeded while syncing stream: %s",
+                        str(exc),
+                    )
+                    frame_broken = True
+                    break
+
+            if frame_broken:
+                continue
 
             if not frame.complete():
                 await asyncio.sleep(IDLE_SLEEP_SECONDS)
@@ -253,40 +302,66 @@ class RctReader:
 
         while self._running:
             now = loop.time()
-
             did_work = False
 
             if now - last_frequent >= FREQUENT_INTERVAL_SECONDS:
-                await self._request_objects(self.FREQUENT_OBJECT_IDS, "frequent")
+                await self._request_objects_if_needed(
+                    object_ids=self.FREQUENT_OBJECT_IDS,
+                    label="frequent",
+                    freshness_threshold_seconds=FREQUENT_REQUEST_IF_OLDER_THAN_SECONDS,
+                )
                 last_frequent = loop.time()
                 did_work = True
 
-            if now - last_infrequent >= INFREQUENT_INTERVAL_SECONDS:
-                await self._request_objects(self.INFREQUENT_OBJECT_IDS, "infrequent")
+            connected_for = now - self._connected_at_loop_time
+            if (
+                connected_for >= INITIAL_INFREQUENT_DELAY_SECONDS
+                and now - last_infrequent >= INFREQUENT_INTERVAL_SECONDS
+            ):
+                await self._request_objects_if_needed(
+                    object_ids=self.INFREQUENT_OBJECT_IDS,
+                    label="infrequent",
+                    freshness_threshold_seconds=INFREQUENT_REQUEST_IF_OLDER_THAN_SECONDS,
+                )
                 last_infrequent = loop.time()
                 did_work = True
 
             if not did_work:
                 await asyncio.sleep(IDLE_SLEEP_SECONDS)
 
-    async def _request_objects(
+    async def _request_objects_if_needed(
         self,
         object_ids: tuple[int, ...],
         label: str,
+        freshness_threshold_seconds: int,
     ) -> None:
         assert self._writer is not None
 
         LOGGER.debug("Reader starting %s request cycle", label)
 
+        requested_count = 0
+        skipped_count = 0
+
         for object_id in object_ids:
             info = REGISTRY.get_by_id(object_id)
             name = info.name
+
+            if self._has_fresh_data(object_id, freshness_threshold_seconds):
+                skipped_count += 1
+                LOGGER.debug(
+                    "Reader skipped request for object %x (%s) in %s cycle because cached data is still fresh",
+                    object_id,
+                    name,
+                    label,
+                )
+                continue
 
             try:
                 frame = SendFrame(command=Command.READ, id=object_id)
                 self._writer.write(frame.data)
                 await self._writer.drain()
 
+                requested_count += 1
                 LOGGER.debug(
                     "Reader requested object %x (%s) in %s cycle",
                     object_id,
@@ -306,3 +381,18 @@ class RctReader:
                 ) from exc
 
             await asyncio.sleep(INTER_REQUEST_DELAY_SECONDS)
+
+        LOGGER.debug(
+            "Reader finished %s request cycle: requested=%s skipped=%s",
+            label,
+            requested_count,
+            skipped_count,
+        )
+
+    def _has_fresh_data(self, object_id: int, max_age_seconds: int) -> bool:
+        entry = self._cache.get(object_id)
+        if entry is None:
+            return False
+
+        age = (datetime.now() - entry.time).total_seconds()
+        return age <= max_age_seconds
