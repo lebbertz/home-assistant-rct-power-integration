@@ -30,26 +30,18 @@ def get_matching_names(expression: str) -> list[str]:
 
 
 battery_sensor_entity_descriptions: list[RctPowerSensorEntityDescription] = [
-    
-    RctPowerSensorEntityDescription(
-        get_device_info=get_battery_device_info,
-        key="battery.temperature",
-        name="Battery Temperature",
-        update_priority=EntityUpdatePriority.FREQUENT,
-        state_class=SensorStateClass.MEASUREMENT,
-    ),
     RctPowerSensorEntityDescription(
         get_device_info=get_battery_device_info,
         key="battery.stored_energy",
         name="Battery Stored Energy",
-        update_priority=EntityUpdatePriority.FREQUENT,
+        update_priority=EntityUpdatePriority.INFREQUENT,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
     RctPowerSensorEntityDescription(
         get_device_info=get_battery_device_info,
         key="battery.used_energy",
         name="Battery Used Energy",
-        update_priority=EntityUpdatePriority.FREQUENT,
+        update_priority=EntityUpdatePriority.INFREQUENT,
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
     RctPowerSensorEntityDescription(
@@ -70,7 +62,6 @@ battery_sensor_entity_descriptions: list[RctPowerSensorEntityDescription] = [
 ]
 
 inverter_sensor_entity_descriptions: list[RctPowerSensorEntityDescription] = [
-
     RctPowerSensorEntityDescription(
         get_device_info=get_inverter_device_info,
         key="dc_conv.dc_conv_struct[0].p_dc",
