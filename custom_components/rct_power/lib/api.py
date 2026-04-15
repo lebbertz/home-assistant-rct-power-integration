@@ -1,5 +1,4 @@
 """Sample API Client."""
-
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +19,7 @@ from ..const import LOGGER
 
 CONNECTION_TIMEOUT = 20
 READ_TIMEOUT = 2
+CACHE_MAX_AGE_SECONDS = 5
 INVERTER_SN_OID = 0x7924ABD9
 
 type ApiResponseValue = (
@@ -72,11 +72,36 @@ class RctPowerApiClient:
         # inverter's firmware doesn't handle it well at the time of writing
         self._connection_lock = Lock()
 
+        # Cache valid responses by object id so that mismatched but valid frames
+        # are not lost and can be reused by later reads.
+        self._response_cache: dict[int, ValidApiResponse] = {}
+
+    def _get_cached_response(self, object_id: int) -> ValidApiResponse | None:
+        cached = self._response_cache.get(object_id)
+        if cached is None:
+            return None
+
+        age_seconds = (datetime.now() - cached.time).total_seconds()
+        if age_seconds > CACHE_MAX_AGE_SECONDS:
+            self._response_cache.pop(object_id, None)
+            return None
+
+        return cached
+
+    def _store_cached_response(
+        self, object_id: int, value: ApiResponseValue, response_time: datetime
+    ) -> ValidApiResponse:
+        response = ValidApiResponse(
+            object_id=object_id,
+            time=response_time,
+            value=value,
+        )
+        self._response_cache[object_id] = response
+        return response
+
     async def get_serial_number(self) -> str | None:
         inverter_data = await self.async_get_data([INVERTER_SN_OID])
-
         inverter_sn_response = inverter_data.get(INVERTER_SN_OID)
-
         if isinstance(inverter_sn_response, ValidApiResponse) and isinstance(
             inverter_sn_response.value, str
         ):
@@ -90,14 +115,15 @@ class RctPowerApiClient:
                 reader, writer = await open_connection(
                     host=self._hostname, port=self._port
                 )
-
                 try:
                     if reader.at_eof():
                         raise UpdateFailed("Read stream closed")
 
                     return {
                         object_id: await self._read_object(
-                            reader=reader, writer=writer, object_id=object_id
+                            reader=reader,
+                            writer=writer,
+                            object_id=object_id,
                         )
                         for object_id in object_ids
                     }
@@ -108,11 +134,24 @@ class RctPowerApiClient:
         self, reader: StreamReader, writer: StreamWriter, object_id: int
     ) -> ApiResponse:
         object_name = REGISTRY.get_by_id(object_id).name
+
+        # First try to satisfy the read from cache.
+        cached_response = self._get_cached_response(object_id)
+        if cached_response is not None:
+            LOGGER.debug(
+                "Using cached RCT Power data for object %x (%s): %s",
+                object_id,
+                object_name,
+                cached_response.value,
+            )
+            return cached_response
+
         read_command_frame = SendFrame(command=Command.READ, id=object_id)
 
         LOGGER.debug(
             "Requesting RCT Power data for object %x (%s)...", object_id, object_name
         )
+
         request_time = datetime.now()
 
         try:
@@ -126,7 +165,6 @@ class RctPowerApiClient:
 
                     while not response_frame.complete() and not reader.at_eof():
                         raw_response = await reader.read(1)
-
                         if len(raw_response) > 0:
                             response_frame.consume(raw_response)
 
@@ -135,21 +173,10 @@ class RctPowerApiClient:
                         data_type = response_object_info.response_data_type
                         received_object_name = response_object_info.name
 
-                        # ignore, if this is not the answer to the latest request
-                        if object_id != response_frame.id:
-                            LOGGER.debug(
-                                "Mismatch of requested and received object ids: requested %x (%s), but received %x (%s)",
-                                object_id,
-                                object_name,
-                                response_frame.id,
-                                received_object_name,
-                            )
-                            continue
-
                         decoded_value: ApiResponseValue = decode_value(
-                            data_type,  # type: ignore
+                            data_type,  # type: ignore[arg-type]
                             response_frame.data,
-                        )  # type: ignore
+                        )  # type: ignore[arg-type]
 
                         LOGGER.debug(
                             "Decoded data for object %x (%s): %s",
@@ -158,9 +185,42 @@ class RctPowerApiClient:
                             decoded_value,
                         )
 
+                        response_time = datetime.now()
+
+                        # Cache every successfully decoded frame, even if it does
+                        # not belong to the currently requested object.
+                        self._store_cached_response(
+                            object_id=response_frame.id,
+                            value=decoded_value,
+                            response_time=response_time,
+                        )
+
+                        if object_id != response_frame.id:
+                            LOGGER.debug(
+                                "Mismatch of requested and received object ids: requested %x (%s), but received %x (%s) - cached for later use",
+                                object_id,
+                                object_name,
+                                response_frame.id,
+                                received_object_name,
+                            )
+
+                            # If the requested object was already cached by an
+                            # earlier mismatched frame, return it immediately.
+                            cached_response = self._get_cached_response(object_id)
+                            if cached_response is not None:
+                                LOGGER.debug(
+                                    "Resolved requested object %x (%s) from cache after mismatch: %s",
+                                    object_id,
+                                    object_name,
+                                    cached_response.value,
+                                )
+                                return cached_response
+
+                            continue
+
                         return ValidApiResponse(
                             object_id=object_id,
-                            time=request_time,
+                            time=response_time,
                             value=decoded_value,
                         )
                     else:
@@ -171,7 +231,9 @@ class RctPowerApiClient:
                             response_frame.data,
                         )
                         return InvalidApiResponse(
-                            object_id=object_id, time=request_time, cause="INCOMPLETE"
+                            object_id=object_id,
+                            time=request_time,
+                            cause="INCOMPLETE",
                         )
 
         except TimeoutError as exc:
@@ -188,33 +250,43 @@ class RctPowerApiClient:
                 "Error reading object %x (%s): %s", object_id, object_name, str(exc)
             )
             return InvalidApiResponse(
-                object_id=object_id, time=request_time, cause="CRC_ERROR"
+                object_id=object_id,
+                time=request_time,
+                cause="CRC_ERROR",
             )
         except FrameLengthExceeded as exc:
             LOGGER.debug(
                 "Error reading object %x (%s): %s", object_id, object_name, str(exc)
             )
             return InvalidApiResponse(
-                object_id=object_id, time=request_time, cause="FRAME_LENGTH_EXCEEDED"
+                object_id=object_id,
+                time=request_time,
+                cause="FRAME_LENGTH_EXCEEDED",
             )
         except InvalidCommand as exc:
             LOGGER.debug(
                 "Error reading object %x (%s): %s", object_id, object_name, str(exc)
             )
             return InvalidApiResponse(
-                object_id=object_id, time=request_time, cause="INVALID_COMMAND"
+                object_id=object_id,
+                time=request_time,
+                cause="INVALID_COMMAND",
             )
         except struct.error as exc:
             LOGGER.debug(
                 "Error reading object %x (%s): %s", object_id, object_name, str(exc)
             )
             return InvalidApiResponse(
-                object_id=object_id, time=request_time, cause="PARSING_ERROR"
+                object_id=object_id,
+                time=request_time,
+                cause="PARSING_ERROR",
             )
         except Exception as exc:
             LOGGER.debug(
                 "Error reading object %x (%s): %s", object_id, object_name, str(exc)
             )
             return InvalidApiResponse(
-                object_id=object_id, time=request_time, cause="UNKNOWN_ERROR"
+                object_id=object_id,
+                time=request_time,
+                cause="UNKNOWN_ERROR",
             )
