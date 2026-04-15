@@ -1,26 +1,14 @@
-"""RCT Power API client."""
+"""RCT Power API client backed by a continuous central reader."""
 from __future__ import annotations
 
+import asyncio
 from asyncio.locks import Lock
 from dataclasses import dataclass
 from datetime import datetime
-from time import monotonic
 
-from homeassistant.helpers.update_coordinator import UpdateFailed
-from rctclient.registry import REGISTRY
 from rctclient.types import EventEntry
 
-from ..const import LOGGER
 from .reader import RctReader
-
-CACHE_MAX_AGE_SECONDS = 6
-
-# Recovery behavior at API level
-POLL_CYCLE_MAX_SECONDS = 6
-RECOVERY_COOLDOWN_SECONDS = 3
-MAX_INVALID_RESPONSES_PER_CYCLE = 5
-
-INVERTER_SN_OID = 0x7924ABD9
 
 type ApiResponseValue = (
     bool
@@ -52,6 +40,12 @@ class InvalidApiResponse(BaseApiResponse):
 type ApiResponse = ValidApiResponse | InvalidApiResponse
 type RctPowerData = dict[int, ApiResponse]
 
+INVERTER_SN_OID = 0x7924ABD9
+
+# How long async_get_data should wait for initial reader warmup / cache population
+INITIAL_CACHE_WAIT_SECONDS = 2.0
+INITIAL_CACHE_POLL_INTERVAL = 0.1
+
 
 def get_valid_response_value_or[_R](
     response: ApiResponse | None, defaultValue: _R
@@ -66,179 +60,71 @@ class RctPowerApiClient:
         self._hostname = hostname
         self._port = port
 
-        # one API cycle at a time
         self._connection_lock = Lock()
-
-        # central reader
         self._reader = RctReader(hostname, port)
+        self._reader_started = False
 
-        # API-level cooldown
-        self._cooldown_until: float = 0.0
+    async def _ensure_reader_started(self) -> None:
+        if self._reader_started:
+            return
 
-    async def _respect_cooldown(self) -> None:
-        remaining = self._cooldown_until - monotonic()
-        if remaining > 0:
-            LOGGER.warning(
-                "RCT API is in recovery cooldown for %.1f more seconds before next polling cycle",
-                remaining,
-            )
-            import asyncio
+        async with self._connection_lock:
+            if self._reader_started:
+                return
 
-            await asyncio.sleep(remaining)
+            await self._reader.start()
+            self._reader_started = True
 
-    def _enter_cooldown(self) -> None:
-        self._cooldown_until = monotonic() + RECOVERY_COOLDOWN_SECONDS
-        LOGGER.warning(
-            "Entering RCT API recovery cooldown for %s seconds",
-            RECOVERY_COOLDOWN_SECONDS,
-        )
+    async def _wait_for_any_requested_data(self, object_ids: list[int]) -> None:
+        """
+        On startup, give the continuous reader a short chance to populate cache.
+        This avoids returning all entities as unavailable immediately after HA start.
+        """
+        deadline = asyncio.get_running_loop().time() + INITIAL_CACHE_WAIT_SECONDS
 
-    def _check_cycle_limits(
-        self,
-        cycle_start: float,
-        invalid_count: int,
-        current_object_id: int | None = None,
-    ) -> None:
-        elapsed = monotonic() - cycle_start
+        while asyncio.get_running_loop().time() < deadline:
+            for object_id in object_ids:
+                if self._reader.get(object_id) is not None:
+                    return
 
-        if elapsed >= POLL_CYCLE_MAX_SECONDS:
-            if current_object_id is not None:
-                object_name = REGISTRY.get_by_id(current_object_id).name
-                LOGGER.error(
-                    "RCT FAIL-FAST TRIGGERED: aborting poll cycle after %.3f seconds at object %x (%s), invalid_count=%s",
-                    elapsed,
-                    current_object_id,
-                    object_name,
-                    invalid_count,
-                )
-            else:
-                LOGGER.error(
-                    "RCT FAIL-FAST TRIGGERED: aborting poll cycle after %.3f seconds, invalid_count=%s",
-                    elapsed,
-                    invalid_count,
-                )
-
-            self._enter_cooldown()
-            raise UpdateFailed(
-                f"Polling cycle exceeded {POLL_CYCLE_MAX_SECONDS} seconds"
-            )
-
-        if invalid_count >= MAX_INVALID_RESPONSES_PER_CYCLE:
-            if current_object_id is not None:
-                object_name = REGISTRY.get_by_id(current_object_id).name
-                LOGGER.error(
-                    "RCT FAIL-FAST TRIGGERED: aborting poll cycle after %s invalid responses at object %x (%s)",
-                    invalid_count,
-                    current_object_id,
-                    object_name,
-                )
-            else:
-                LOGGER.error(
-                    "RCT FAIL-FAST TRIGGERED: aborting poll cycle after %s invalid responses",
-                    invalid_count,
-                )
-
-            self._enter_cooldown()
-            raise UpdateFailed(
-                f"Polling cycle exceeded {MAX_INVALID_RESPONSES_PER_CYCLE} invalid responses"
-            )
+            await asyncio.sleep(INITIAL_CACHE_POLL_INTERVAL)
 
     async def get_serial_number(self) -> str | None:
-        inverter_data = await self.async_get_data([INVERTER_SN_OID])
-        inverter_sn_response = inverter_data.get(INVERTER_SN_OID)
-        if isinstance(inverter_sn_response, ValidApiResponse) and isinstance(
-            inverter_sn_response.value, str
-        ):
-            return inverter_sn_response.value
+        await self._ensure_reader_started()
+
+        # Give the reader a short chance to see inverter_sn
+        deadline = asyncio.get_running_loop().time() + INITIAL_CACHE_WAIT_SECONDS
+        while asyncio.get_running_loop().time() < deadline:
+            entry = self._reader.get(INVERTER_SN_OID)
+            if entry is not None and isinstance(entry.value, str):
+                return entry.value
+            await asyncio.sleep(INITIAL_CACHE_POLL_INTERVAL)
+
         return None
 
     async def async_get_data(self, object_ids: list[int]) -> RctPowerData:
-        async with self._connection_lock:
-            await self._respect_cooldown()
+        await self._ensure_reader_started()
 
-            cycle_start = monotonic()
-            invalid_count = 0
-            results: RctPowerData = {}
+        # Especially after HA start, give the reader a moment to fill cache
+        await self._wait_for_any_requested_data(object_ids)
 
-            try:
-                for object_id in object_ids:
-                    # Check before starting next read
-                    self._check_cycle_limits(
-                        cycle_start=cycle_start,
-                        invalid_count=invalid_count,
-                        current_object_id=object_id,
-                    )
+        results: RctPowerData = {}
+        now = datetime.now()
 
-                    response = await self._read_object(object_id)
-                    results[object_id] = response
+        for object_id in object_ids:
+            entry = self._reader.get(object_id)
 
-                    if isinstance(response, InvalidApiResponse):
-                        invalid_count += 1
-                        object_name = REGISTRY.get_by_id(object_id).name
-                        LOGGER.debug(
-                            "RCT invalid response %s/%s for object %x (%s), cause=%s",
-                            invalid_count,
-                            MAX_INVALID_RESPONSES_PER_CYCLE,
-                            object_id,
-                            object_name,
-                            response.cause,
-                        )
-                    else:
-                        # a valid response resets the streak severity
-                        invalid_count = 0
-
-                    # Check again after the read completed
-                    self._check_cycle_limits(
-                        cycle_start=cycle_start,
-                        invalid_count=invalid_count,
-                        current_object_id=object_id,
-                    )
-
-                return results
-
-            except UpdateFailed:
-                raise
-            except Exception as exc:
-                LOGGER.error(
-                    "RCT API hard failure, forcing cooldown and reconnect: %s",
-                    str(exc),
-                )
-                self._enter_cooldown()
-                raise UpdateFailed(f"Hard RCT API failure: {str(exc)}") from exc
-
-    async def _read_object(self, object_id: int) -> ApiResponse:
-        object_name = REGISTRY.get_by_id(object_id).name
-
-        try:
-            result = await self._reader.read_object(object_id)
-
-            if result is None:
-                LOGGER.debug(
-                    "Reader returned no data for object %x (%s)",
-                    object_id,
-                    object_name,
-                )
-                return InvalidApiResponse(
+            if entry is None:
+                results[object_id] = InvalidApiResponse(
                     object_id=object_id,
-                    time=datetime.now(),
-                    cause="READER_NO_DATA",
+                    time=now,
+                    cause="CACHE_MISS_OR_STALE",
+                )
+            else:
+                results[object_id] = ValidApiResponse(
+                    object_id=object_id,
+                    time=entry.time,
+                    value=entry.value,
                 )
 
-            return ValidApiResponse(
-                object_id=object_id,
-                time=result.time,
-                value=result.value,
-            )
-
-        except Exception as exc:
-            LOGGER.debug(
-                "Reader error for object %x (%s): %s",
-                object_id,
-                object_name,
-                str(exc),
-            )
-            return InvalidApiResponse(
-                object_id=object_id,
-                time=datetime.now(),
-                cause="READER_ERROR",
-            )
+        return results
